@@ -13,17 +13,16 @@ logging.basicConfig(filename='C:/Users/Corey/OneDrive/OneDrive - New Mexico High
 
 
 def main():
-    # Fill this in before running!!!!
-    path = 'C:/Users/Corey/OneDrive/OneDrive - New Mexico Highlands University/Python/FFI/XMLToCustom/data'
-
-    # DEBUGGING
-    debug = False
-    # debug = True
+    # Make sure you have a data/ directory in the main directory for this project before running.
+    data_path = 'data'
+    base_path = os.getcwd()
+    path = os.path.join(base_path, data_path)
 
     # users need to create their own local config file (see README)
     config = configparser.ConfigParser()
     config.read('config.ini')
 
+    # create database connection
     sql_config = config['LocalMSSQL']
     sql_url = create_url(**sql_config)
     sql_engine = create_engine(sql_url)
@@ -45,9 +44,9 @@ def main():
 
         ffi_data = FFIFile(export)
 
-        ffi_data.format_tables()
-
-        ffi_data.tables_to_db(server)
+        ffi_data.extract()
+        ffi_data.transform()
+        ffi_data.load(server)
 
         if len(ffi_data.insert_failed) == 0:
             shutil.move(file, os.path.join(processed, export.name))

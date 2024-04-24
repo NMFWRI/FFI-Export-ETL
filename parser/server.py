@@ -5,7 +5,8 @@ from sqlalchemy.orm import Session
 
 class FFIDatabase:
     """
-    this represents everything you will need from an FFI database
+    this represents everything you will need from an FFI database. Contains some SQLAlchemy bits, as well as all primary
+    and foreign keys
     """
 
     def __init__(self, engine):
@@ -37,5 +38,8 @@ class FFIDatabase:
         return self._foreign_keys
 
     def start_session(self):
+        """
+        Starts a session for executing SQL statements
+        """
         return Session(self.engine)
 
