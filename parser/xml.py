@@ -53,12 +53,8 @@ class FFIFile:
         self.many_tables = False
         self._user = os.environ['USERNAME']
 
-        print(f"Reading data for {self.file}")
-        logging.info(f"Transforming tables for {self.file}")
-        self._parse_data()
-        self._parse_idents()
-        self.version = self['Schema_Version']['Schema_Version'][0]
-        self.admin_unit = self['RegistrationUnit']['RegistrationUnit_Name'][0]
+        self.version = None
+        self.admin_unit = None
         self.insert_failed = []
         # current = datetime.datetime.now()
         # self.log_file = f"Migration_Log_{current.year}{current.month}{current.day}{current.hour}{current.minute}{current.second}.log"
@@ -245,18 +241,28 @@ class FFIFile:
             attr_select = attr_data[select_list]
 
         attr_long = attr_select.rename(columns=select_rename)  # renaming columns
-        methods = attr_long['Method_Name'].unique()
+        methods = attr_long['Method_Name'].unique()  # get unique table names
+
+        # Iterates through each method name, subsets those data from the main dataset, and performs some transformations
         for method in methods:
             print(method)
-            temp = attr_long.loc[attr_long['Method_Name'] == method].drop_duplicates()
+            temp = attr_long.loc[attr_long['Method_Name'] == method].drop_duplicates()  # make sure no duplicate data
+
+            # We have to take the subset before pivoting - this pivots on the appropriate unique identifiers
+            # Some of this behavior is artefactual of attempting to reproduce FFI tables, but that plan was abandoned,
+            # so some of this is superfluous to the actual code behavior.
+            # TODO: Remove superfluous code behavior
             subset = temp.pivot(index=['EventID', 'SampleData_SampleEvent_GUID',
                                        'AttributeData_DataRow_GUID', 'Method_UnitSystem'],
                                 columns=['MethodAtt_FieldName'],
                                 values='AttributeData_Value').reset_index()
             unit_systems = subset['Method_UnitSystem'].unique()
+
+            # Normalize the table names from previous naming convention
             table_name = method.replace(' ', '').replace('-', '_').replace('(', '_').replace(')', '_').strip('_')
 
             for col in subset.columns:
+                # Ensures species columns use the actual USDA code, not the Spp_GUID
                 if 'Spp' in col:
                     spp_df = self['LocalSpecies']
                     subset['Species'] = subset.apply(lambda row:
@@ -265,18 +271,22 @@ class FFIFile:
                                                      ].iloc[0]['LocalSpecies_Symbol'],
                                                      axis=1)
 
+            # Assign tree stem count to TreesIndv
             if method == 'Trees - Individuals':
                 subset['StemNum'] = subset.groupby(['EventID', 'Species', 'TagNo']).cumcount() + 1
+
+            # If TagNo is not included in witness tree info, assign new counts. Might need to QC this.
             elif method == 'Plot Info Wit Trees Comments3':
                 if 'WitTreeTagNo' not in subset.columns:
                     subset['WitTreeTagNo'] = subset.groupby(['EventID']).cumcount() + 1
+                # also ensures there isn't more than one witness tree per plot/event
                 subset.sort_values(['EventID', 'WitDBH'], inplace=True)
                 subset.drop_duplicates('EventID', keep='first', inplace=True)
-                # subset['StemNum'] = subset.groupby(['EventID', 'WitTreeTagNo']).cumcount() + 1
-            # elif method == 'Trees - Seedlings (Height Class)':
-            #     subset['Status'] = subset['Status'].fillna('Unk')
+
+            # Drop all rows with null EventIDs
             subset.dropna(subset=['EventID'], inplace=True)
 
+            # Some tables have Metric and English unit systems. We need to break these out so we don't mess up the names
             if len(unit_systems) > 1:
                 for unit_system in unit_systems:
                     unit_subset = subset.loc[subset['Method_UnitSystem'] == unit_system]
@@ -286,11 +296,17 @@ class FFIFile:
                         sql_table = f"{table_name}_Attribute"
                     self._data_map[sql_table] = unit_subset
             else:
-                sql_table = f"{table_name}_Attribute"
-                subset.drop(columns=['Method_UnitSystem'], axis=1, inplace=True)
-                self._data_map[sql_table] = subset
+                # TODO: drop this and we won't need to use the TableMap anymore
+                sql_table = f"{table_name}_Attribute"  # Rename to FFI table standard
+                subset.drop(columns=['Method_UnitSystem'], axis=1, inplace=True)  # Drop the unit column
+                self._data_map[sql_table] = subset  # Add table to our data map
 
     def _sample_to_many(self):
+        """
+        Breaks the methods into their SampleData components in a similar way as AttributeData.
+        SampleData is metadata on how the data was sampled (e.g. personnel, plot size, units, notes, etc)
+        """
+
         select_list = ['SampleRow_Original_GUID', 'SampleData_SampleEvent_GUID', 'SampleAtt_FieldName',
                        'SampleData_Value', 'SampleRow_CreatedBy', 'SampleRow_CreatedDate', 'SampleRow_ModifiedBy',
                        'SampleRow_ModifiedDate', 'Method_Name', 'Method_UnitSystem']
@@ -320,8 +336,12 @@ class FFIFile:
             sample_select = sample_data[select_list]
 
         sample_long = sample_select.rename(columns=select_rename)
+
+        # Some weird stuff with FFI where the SampleData doesn't actually have GUID assigned, so we need to create one.
         sample_long['SampleData_Original_GUID'] = sample_long.apply(lambda _: str(uuid4()).upper())
         methods = sample_long['Method_Name'].unique()
+
+        # Iterate through each method and create a _Sample table for it.
         for method in methods:
             temp = sample_long.loc[sample_long['Method_Name'] == method]
             subset = temp.pivot(index=['SampleData_SampleRow_GUID', 'SampleData_SampleEvent_GUID',
@@ -347,7 +367,11 @@ class FFIFile:
                 self._data_map[sql_table] = subset
 
     def _process_events(self):
-
+        """
+        SampleEvent needs some processing. Some of the FFI protocols have multiple "Personnel" columns that track
+        who collected data and who recorded. This weird function combines all the FieldTeam and EntryTeam columns,
+        respectively.
+        """
         def parse_list_val(val):
             if (val is not None) and (str(val) != 'nan') and str(val) != '' and str(val) != ' ':
                 comma_parse = val.split(',')
@@ -484,7 +508,10 @@ class FFIFile:
         self._data_map['SampleEvent'] = temp_events
 
     def _process_projects(self):
-
+        """
+        Projects also need some processing; we need to extract the year for visits and construct a VisitID.
+        This enables us to connect monitoring status to our events.
+        """
         temp_df = self['MonitoringStatus'] \
             .merge(self['MM_MonitoringStatus_SampleEvent'],
                    how='left',
@@ -519,6 +546,7 @@ class FFIFile:
                                                         ),
                                            axis=1)
 
+        # Join the new data onto Event and write that (and ProjectVisit) to our data map
         event_df = self['SampleEvent'] \
             .merge(temp_df[['MM_SampleEvent_GUID', 'VisitID']],
                    how='left',
@@ -528,41 +556,14 @@ class FFIFile:
         self._data_map['SampleEvent'] = event_df
         self._data_map['ProjectVisit'] = temp_df
 
-    def format_tables(self):
-
-        self._attr_to_many()
-        self._sample_to_many()
-
-        # need to normalize project names for ProjectID
-        self['ProjectUnit']['ProjectID'] = self['ProjectUnit'].apply(
-            lambda row: row['ProjectUnit_Name'].replace('_', '').replace(' ', ''),
-            axis=1
-        )
-
-        # add admin unit for data quality
-        self['ProjectUnit']['AdminUnit'] = self.admin_unit
-        self['MacroPlot']['AdminUnit'] = self.admin_unit
-
-        # Create transects from SurfaceFuels_Fine_Attribute
-        temp_df = self['SurfaceFuels_Fine_Attribute'][['EventID', 'Transect', 'Azimuth', 'Slope']].drop_duplicates()
-        temp_df['Length'] = 75
-        self['Transect'] = temp_df
-
-        self._process_events()
-        self._process_projects()
-
-        del self._data_map['SampleData']
-        del self._data_map['SampleRow']
-        del self._data_map['AttributeRow']
-        del self._data_map['AttributeData']
-
-        self.many_tables = True
-
     def _insert_into_db(self, ffi_db, table):
         """
         Checks foreign key constraints and inserts any necessary tables first.
 
         Then generates a MERGE INTO statement directly creating a query with the data values and executes that statement
+
+        :param ffi_db: FFIDatabase object representing the database connection
+        :param table: the table to be inserted into the database, as a string
         """
 
         # Next block pulls in the field and table mappings that were built for the old column and table names to align
@@ -608,9 +609,6 @@ class FFIFile:
 
             if table == 'ProjectVisit':
                 final_table.drop_duplicates(inplace=True)
-            # for k in table_pks:
-            #     if k == 'ID':  # we need to make sure the types are preserved
-            #         xml_table[k] = xml_table[k].astype('int64')
 
             # Construct the VALUES part of the statement
             val_list = []
@@ -667,19 +665,28 @@ class FFIFile:
             with ffi_db.start_session() as sesh:
                 try:
                     count_sql = f"SELECT COUNT(*) AS Size FROM {table_name}"
-                    before_df = pd.read_sql(count_sql, sesh.bind)
+                    before_df = pd.read_sql(count_sql, sesh.bind)  # Compare before and after row count of tables
                     before_count = before_df['Size'].values[0]
+
+                    # Insert data
                     sesh.execute(merge_into_sql)
                     sesh.commit()
 
+                    # Get count after insert
                     after_df = pd.read_sql(count_sql, sesh.bind)
                     after_count = after_df['Size'].values[0]
 
                     count_diff = after_count - before_count
+
+                    # Then we insert into our logging table for who made changes to the database tables
                     if count_diff != 0:
                         change_type = "INSERT" if count_diff > 0 else "DELETE"
+
+                        # handle datetime
                         dt = str(datetime.datetime.now())
                         new_dt = re.findall(r'(.*)\.\d{4}', dt)[0]
+
+                        # construct log data and insert
                         change_df = DataFrame({'User': [self._user],
                                                'Time': [new_dt],
                                                'Table': [table_name],
@@ -688,7 +695,9 @@ class FFIFile:
                         change_df.to_sql('UpdateLog', sesh.bind, if_exists='append', index=False)
                     print(f"Inserted {count_diff} rows into {table_name}.")
                     logging.info(f"Inserted {count_diff} rows into {table_name}.")
+
                 except Exception as e:
+                    # If there's any issues merging the data, throw an error and rollback the MERGE
                     print(f"Failed to insert data into {table_name}.")
                     self.insert_failed.append(table)
                     sesh.rollback()
@@ -697,7 +706,46 @@ class FFIFile:
                         print(error)
                         logging.exception(f"Failed to insert data for {table_name}.")
 
-    def tables_to_db(self, ffi_db):
+    def extract(self):
+
+        print(f"Reading data for {self.file}")
+        logging.info(f"Transforming tables for {self.file}")
+        self._parse_data()
+        self._parse_idents()
+        self.version = self['Schema_Version']['Schema_Version'][0]
+        self.admin_unit = self['RegistrationUnit']['RegistrationUnit_Name'][0]
+
+    def transform(self):
+
+        self._attr_to_many()
+        self._sample_to_many()
+
+        # need to normalize project names for ProjectID
+        self['ProjectUnit']['ProjectID'] = self['ProjectUnit'].apply(
+            lambda row: row['ProjectUnit_Name'].replace('_', '').replace(' ', ''),
+            axis=1
+        )
+
+        # add admin unit for data quality
+        self['ProjectUnit']['AdminUnit'] = self.admin_unit
+        self['MacroPlot']['AdminUnit'] = self.admin_unit
+
+        # Create transects from SurfaceFuels_Fine_Attribute
+        temp_df = self['SurfaceFuels_Fine_Attribute'][['EventID', 'Transect', 'Azimuth', 'Slope']].drop_duplicates()
+        temp_df['Length'] = 75
+        self['Transect'] = temp_df
+
+        self._process_events()
+        self._process_projects()
+
+        del self._data_map['SampleData']
+        del self._data_map['SampleRow']
+        del self._data_map['AttributeRow']
+        del self._data_map['AttributeData']
+
+        self.many_tables = True
+
+    def load(self, ffi_db):
         """
         Iterates through each table in the data map and inserts it into the database
         """
