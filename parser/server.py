@@ -1,6 +1,8 @@
 import pandas as pd
+import sqlalchemy.exc
 from sqlalchemy import MetaData
 from sqlalchemy.orm import Session
+from os.path import join
 
 
 class FFIDatabase:
@@ -9,7 +11,7 @@ class FFIDatabase:
     and foreign keys
     """
 
-    def __init__(self, engine):
+    def __init__(self, engine, new=False):
         self.engine = engine
         self.meta = MetaData()
         self.meta.reflect(self.engine)
@@ -17,15 +19,16 @@ class FFIDatabase:
         self._primary_keys = None
         self._foreign_keys = None
 
-    def get_primary_keys(self):
+        self._populate_pks()
+        self._populate_fks()
+
+    def _populate_pks(self):
         if not self._primary_keys:
             pks = {table: [column.name for column in self.tables[table].primary_key.columns]
                              for table in self.tables}
             self._primary_keys = pks
 
-        return self._primary_keys
-
-    def get_foreign_keys(self):
+    def _populate_fks(self):
         if not self._foreign_keys:
             fks = {table: {column.name: [(fk.column.table.name, fk.column.name)
                                          for fk in column.foreign_keys]
@@ -35,6 +38,10 @@ class FFIDatabase:
                    for table in self.tables}
             self._foreign_keys = fks
 
+    def get_primary_keys(self):
+        return self._primary_keys
+
+    def get_foreign_keys(self):
         return self._foreign_keys
 
     def start_session(self):
@@ -42,4 +49,34 @@ class FFIDatabase:
         Starts a session for executing SQL statements
         """
         return Session(self.engine)
+
+    def create_schema(self, schema_name):
+        """
+        Attempts to create a new schema on the server.
+        """
+        with self.start_session() as s:
+            try:
+                s.execute(f"CREATE SCHEMA {schema_name}")
+                s.commit()
+            except sqlalchemy.exc.ProgrammingError:
+                pass
+
+    def insert_codes(self):
+        """
+        This will insert the data for damage codes, damage severity, and species saved as .csv in the program directory
+        :return: static method
+        """
+
+        for table in ['LUDamageCodes', 'LUDamageSev', 'LUSpecies']:
+            csv_file = table + '.csv'
+            csv_path = join('./extra', csv_file)
+
+            df = pd.read_csv(csv_path, encoding='latin')
+            with Session(self.engine) as conn:
+                try:
+                    df.to_sql(table, conn.bind, if_exists='append', index=False)
+                except Exception as e:
+                    conn.rollback()
+                    print(e)
+
 
