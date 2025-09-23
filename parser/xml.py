@@ -1,21 +1,28 @@
 import os
 import re
+import time
 from uuid import uuid4
+
+import numpy
+import sqlalchemy.exc
 from pandas import DataFrame, concat, options
+# from polars import
 from re import findall
 from parser.functions import strip_namespace, convert_datetime
+from copy import deepcopy
 import xml.etree.ElementTree as ET
 import datetime
-# import logging
 import warnings
 import logging
 warnings.simplefilter(action='ignore', category=FutureWarning)
 import pandas as pd
 
 options.mode.chained_assignment = None
-logging.basicConfig(filename='C:/Users/Corey/OneDrive/OneDrive - New Mexico Highlands University/Python/FFI/XMLToCustom/log/data.log',
+LOG_NAME = 'C:/Users/Corey/OneDrive/OneDrive - New Mexico Highlands University/Python/FFI/Export-ETL_NEW/log/data.log'
+logging.basicConfig(filename=LOG_NAME,
                     format='%(asctime)s - %(levelname)s - %(message)s',
-                    datefmt='%d-%b-%y %H:%M')
+                    datefmt='%d-%b-%y %H:%M',
+                    level=logging.INFO)
 
 
 class FFIFile:
@@ -39,26 +46,32 @@ class FFIFile:
         self._tree = ET.parse(file)
         self._root = self._tree.getroot()
         self._namespace = findall(r'\{http://\w+\.\w{3}[\w/.\d]+\}', self._root.tag)[0].strip('{}')
-        self._base_tables = {}
         self._data_map = {}
         self._excluded = ['FuelConstants_DL', 'FuelConstants_ExpDL', 'FuelConstants_FWD', 'FuelConstants_Veg',
                           'FuelConstants_CWD', 'Schema_Version', 'Program', 'Project', 'DataGridViewSettings',
                           'MasterSpecies_LastModified', 'Settings']
         self._processed = []
-        # self._tables = {}
-        # self._filtered = False
-        self._retry_tables = {}
-        self.duplicate = False
-        self.dup_on = None
         self.many_tables = False
         self._user = os.environ['USERNAME']
+
+        self.table_map = pd.read_csv("extra/TableMap.csv")
+        self.field_map = pd.read_csv("extra/FieldMap.csv")
+
+        # Excel keeps generating long trails of ' ' at the end of strings. This fixes that
+        self.field_map = self.field_map.applymap(lambda x: x.replace(' ', '')
+                                        if type(x) == str
+                                        else x)
+
+        self.new_tables = ['AdminUnit', 'Plot', 'Event', 'GroundCover', 'CanopyDensiometer', 'AerialCover',
+                           'Fuels1000Hr', 'FuelsDuffLitter', 'FuelsVegetation', 'FuelsFine', 'Project', 'TreesIndv',
+                           'TreesSaplings', 'TreesSeedlings', 'TreeDamage', 'WitnessTree', 'Transect', 'ProjectVisit',
+                           'Transect']
 
         self.version = None
         self.admin_unit = None
         self.insert_failed = []
         # current = datetime.datetime.now()
         # self.log_file = f"Migration_Log_{current.year}{current.month}{current.day}{current.hour}{current.minute}{current.second}.log"
-        # self._parse_idents()
 
     def __setitem__(self, key, value):
         if type(value) == pd.DataFrame:
@@ -80,7 +93,7 @@ class FFIFile:
             raise KeyError(f'{item} not in FFI XML file.')
 
     @staticmethod
-    def _update_last_modified(self, session):
+    def _update_last_modified(session):
         """
         Just updates the LastModified table with current user
         """
@@ -103,25 +116,26 @@ class FFIFile:
         Iterates through each element name that was produced in the __init__ operation. This is what actually populates
         the data_map element
         """
-        # needed_tables = ['MacroPlot', 'RegistrationUnit', 'MM_ProjectUnit_MacroPlot', 'ProjectUnit', 'SampleEvent',
-        #                  'MM_MonitoringStatus_SampleEvent', 'MonitoringStatus', 'MethodAttribute', 'AttributeData',
-        #                  'Method', 'LU_DataType', 'Schema_Version', 'MasterSpecies', 'SampleData', 'SampleAttribute',
-        #                  'LocalSpecies']
+        needed_tables = ['MacroPlot', 'RegistrationUnit', 'MM_ProjectUnit_MacroPlot', 'ProjectUnit', 'SampleEvent',
+                         'MM_MonitoringStatus_SampleEvent', 'MonitoringStatus', 'MethodAttribute', 'AttributeRow',
+                         'AttributeData', 'Method', 'LU_DataType', 'Schema_Version', 'MasterSpecies', 'SampleData',
+                         'SampleAttribute', 'LocalSpecies', 'SampleRow']
 
         tags = set([strip_namespace(element.tag) for element in self._root])
         for tag in tags:
-            all_data = self._root.findall(tag, namespaces={'': self._namespace})
-            dfs = [
-                DataFrame({strip_namespace(attr.tag): [attr.text] for attr in data_set})
-                for data_set in all_data
-            ]
-            df = concat(dfs)
-            for col in df.columns:
-                if '_GUID' in col:
-                    df[col] = df[col].apply(lambda row: row.upper())
-                elif 'Date' in col or 'Time' in col:
-                    df[col] = df[col].apply(lambda row: convert_datetime(row))
-            self._data_map[strip_namespace(tag)] = df.reset_index(drop=True)
+            if tag in needed_tables:
+                all_data = self._root.findall(tag, namespaces={'': self._namespace})
+                dfs = [
+                    {strip_namespace(attr.tag): attr.text for attr in data_set}
+                    for data_set in all_data
+                ]
+                df = DataFrame(dfs)
+                for col in df.columns:
+                    if '_GUID' in col:
+                        df[col] = df[col].apply(lambda row: row.upper())
+                    elif 'Date' in col or 'Time' in col:
+                        df[col] = df[col].apply(lambda row: convert_datetime(row))
+                self._data_map[strip_namespace(tag)] = df.reset_index(drop=True)
 
     def _parse_idents(self):
         """
@@ -177,7 +191,6 @@ class FFIFile:
                     id_value = ''
 
             return id_value
-        # end of function
 
         for table in ['MacroPlot', 'SampleEvent']:
             temp_df = self[table]
@@ -203,6 +216,7 @@ class FFIFile:
         select_list = ['EventID', 'SampleData_SampleEvent_GUID', 'AttributeRow_DataRow_GUID',
                        'MethodAtt_FieldName', 'AttributeData_Value', 'Method_Name', 'Method_UnitSystem']
 
+        # Weird edge case stuff
         select_rename = {'AttributeRow_DataRow_GUID': 'AttributeData_DataRow_GUID',
                          'SampleRow_Original_GUID': 'AttributeData_SampleRow_GUID',
                          'AttributeRow_Original_GUID': 'AttributeData_Original_GUID',
@@ -233,7 +247,8 @@ class FFIFile:
         try:
             attr_select = attr_data[select_list]
         except KeyError:  # these fields are in the SQL tables, but aren't included in the XML
-            # I can probably get rid of this, but I'm not sure how the indexing and renaming would work, so I'll
+            # I can probably get rid of this, but I'm not sure how the indexing and renaming would work,
+            # so I'll leave it
             attr_data['AttributeRow_CreatedBy'] = pd.NA
             attr_data['AttributeRow_CreatedDate'] = pd.NA
             attr_data['AttributeRow_ModifiedBy'] = pd.NA
@@ -274,6 +289,51 @@ class FFIFile:
             # Assign tree stem count to TreesIndv
             if method == 'Trees - Individuals':
                 subset['StemNum'] = subset.groupby(['EventID', 'Species', 'TagNo']).cumcount() + 1
+                # if 'DamCd1' in subset.columns:
+                #     subset['DamSev1'] = subset.apply(lambda row: str(round(float(row['CharHt']) / float(row['Ht']), 1) * 100)
+                #                                      if row['DamCd1'] == '30000'
+                #                                      else
+                #                                      ''
+                #                                      if pd.isna(row['DamSev1']) and not pd.isna(row['DamCd1'])
+                #                                      else
+                #                                      row['DamSev1'],
+                #                                      axis=1)
+                # if 'DamCd2' in subset.columns:
+                #     subset['DamSev2'] = subset.apply(lambda row: str(round(float(row['CharHt']) / float(row['Ht']), 1) * 100)
+                #                                      if row['DamCd2'] == '30000'
+                #                                      else
+                #                                      ''
+                #                                      if pd.isna(row['DamSev2']) and not pd.isna(row['DamCd2'])
+                #                                      else
+                #                                      row['DamSev2'],
+                #                                      axis=1)
+                # if 'DamCd3' in subset.columns:
+                #     subset['DamSev3'] = subset.apply(lambda row: str(round(float(row['CharHt']) / float(row['Ht']), 1) * 100)
+                #                                      if row['DamCd3'] == '30000'
+                #                                      else
+                #                                      ''
+                #                                      if pd.isna(row['DamSev3']) and not pd.isna(row['DamCd3'])
+                #                                      else
+                #                                      row['DamSev3'],
+                #                                      axis=1)
+                # if 'DamCd4' in subset.columns:
+                #     subset['DamSev4'] = subset.apply(lambda row: str(round(float(row['CharHt']) / float(row['Ht']), 1) * 100)
+                #                                      if row['DamCd4'] == '30000'
+                #                                      else
+                #                                      ''
+                #                                      if pd.isna(row['DamSev4']) and not pd.isna(row['DamCd4'])
+                #                                      else
+                #                                      row['DamSev4'],
+                #                                      axis=1)
+                # if 'DamCd5' in subset.columns:
+                #     subset['DamSev5'] = subset.apply(lambda row: str(round(float(row['CharHt']) / float(row['Ht']), 1) * 100)
+                #                                      if row['DamCd5'] == '30000'
+                #                                      else
+                #                                      ''
+                #                                      if pd.isna(row['DamSev5']) and not pd.isna(row['DamCd5'])
+                #                                      else
+                #                                      row['DamSev5'],
+                #                                      axis=1)
 
             # If TagNo is not included in witness tree info, assign new counts. Might need to QC this.
             elif method == 'Plot Info Wit Trees Comments3':
@@ -282,6 +342,14 @@ class FFIFile:
                 # also ensures there isn't more than one witness tree per plot/event
                 subset.sort_values(['EventID', 'WitDBH'], inplace=True)
                 subset.drop_duplicates('EventID', keep='first', inplace=True)
+
+            # 6/10/25 logic for CanopyDensiometer dots or squares method
+            elif method == 'Canopy - Densiometer':
+                if 'DotsCount' in subset.columns:
+                    subset['Method'] = subset.apply(lambda row: 'Dots' if row['DotsCount'] == '96'
+                                                    else 'Squares' if row['DotsCount'] == '24'
+                                                    else '',
+                                                    axis=1)
 
             # Drop all rows with null EventIDs
             subset.dropna(subset=['EventID'], inplace=True)
@@ -449,37 +517,75 @@ class FFIFile:
                 )
                 return all_tree_entry
 
-        self['SurfaceFuels_Duff_Litter_Sample']['DuffFieldTeam'] = self['SurfaceFuels_Duff_Litter_Sample']['FieldTeam']
-        self['SurfaceFuels_Duff_Litter_Sample']['DuffEntryTeam'] = self['SurfaceFuels_Duff_Litter_Sample']['EntryTeam']
+        # 1/29/2025: KeyError exceptions added to handle circumstances where personnel was not entered
+        try:
+            self['SurfaceFuels_Duff_Litter_Sample']['DuffFieldTeam'] = self['SurfaceFuels_Duff_Litter_Sample']['FieldTeam']
+        except KeyError:
+            self['SurfaceFuels_Duff_Litter_Sample']['DuffFieldTeam'] = ""
 
-        self['SurfaceFuels_1000Hr_Sample']['HrFieldTeam'] = self['SurfaceFuels_1000Hr_Sample']['FieldTeam']
-        self['SurfaceFuels_1000Hr_Sample']['HrEntryTeam'] = self['SurfaceFuels_1000Hr_Sample']['EntryTeam']
+        try:
+            self['SurfaceFuels_Duff_Litter_Sample']['DuffEntryTeam'] = self['SurfaceFuels_Duff_Litter_Sample']['EntryTeam']
+        except KeyError:
+            self['SurfaceFuels_Duff_Litter_Sample']['DuffEntryTeam'] = ""
 
-        self['SurfaceFuels_Fine_Sample']['FineFieldTeam'] = self['SurfaceFuels_Fine_Sample']['FieldTeam']
-        self['SurfaceFuels_Fine_Sample']['FineEntryTeam'] = self['SurfaceFuels_Fine_Sample']['EntryTeam']
+        try:
+            self['SurfaceFuels_1000Hr_Sample']['HrFieldTeam'] = self['SurfaceFuels_1000Hr_Sample']['FieldTeam']
+        except KeyError:
+            self['SurfaceFuels_1000Hr_Sample']['HrFieldTeam'] = ""
 
-        self['SurfaceFuels_Vegetation_Sample']['VegFieldTeam'] = self['SurfaceFuels_Vegetation_Sample']['FieldTeam']
-        self['SurfaceFuels_Vegetation_Sample']['VegEntryTeam'] = self['SurfaceFuels_Vegetation_Sample']['EntryTeam']
+        try:
+            self['SurfaceFuels_1000Hr_Sample']['HrEntryTeam'] = self['SurfaceFuels_1000Hr_Sample']['EntryTeam']
+        except KeyError:
+            self['SurfaceFuels_1000Hr_Sample']['HrEntryTeam'] = ""
 
-        self['Trees_Individuals_Sample']['TreesFieldTeam'] = self['Trees_Individuals_Sample']['FieldTeam']
+        try:
+            self['SurfaceFuels_Fine_Sample']['FineFieldTeam'] = self['SurfaceFuels_Fine_Sample']['FieldTeam']
+        except KeyError:
+            self['SurfaceFuels_Fine_Sample']['FineFieldTeam'] = ""
+
+        try:
+            self['SurfaceFuels_Fine_Sample']['FineEntryTeam'] = self['SurfaceFuels_Fine_Sample']['EntryTeam']
+        except KeyError:
+            self['SurfaceFuels_Fine_Sample']['FineEntryTeam'] = ""
+
+        try:
+            self['SurfaceFuels_Vegetation_Sample']['VegFieldTeam'] = self['SurfaceFuels_Vegetation_Sample']['FieldTeam']
+        except KeyError:
+            self['SurfaceFuels_Vegetation_Sample']['VegFieldTeam'] = ""
+
+        try:
+            self['SurfaceFuels_Vegetation_Sample']['VegEntryTeam'] = self['SurfaceFuels_Vegetation_Sample']['EntryTeam']
+        except KeyError:
+            self['SurfaceFuels_Vegetation_Sample']['VegEntryTeam'] = ""
+
+        try:
+            self['Trees_Individuals_Sample']['TreesFieldTeam'] = self['Trees_Individuals_Sample']['FieldTeam']
+        except KeyError:
+            self['Trees_Individuals_Sample']['TreesFieldTeam'] = ""
+
         try:
             self['Trees_Individuals_Sample']['TreesEntryTeam'] = self['Trees_Individuals_Sample']['EntryTeam']
         except KeyError:
-            self['Trees_Individuals_Sample']['TreesEntryTeam'] = self['Trees_Individuals_Sample']['FieldTeam']
+            self['Trees_Individuals_Sample']['TreesEntryTeam'] = ""
 
-        self['Trees_Saplings_DiameterClass_Sample']['SapFieldTeam'] = self['Trees_Saplings_DiameterClass_Sample']['FieldTeam']
+        try:
+            self['Trees_Saplings_DiameterClass_Sample']['SapFieldTeam'] = self['Trees_Saplings_DiameterClass_Sample']['FieldTeam']
+        except KeyError:
+            self['Trees_Saplings_DiameterClass_Sample']['SapFieldTeam'] = ""
+
         try:
             self['Trees_Saplings_DiameterClass_Sample']['SapEntryTeam'] = self['Trees_Saplings_DiameterClass_Sample']['EntryTeam']
         except KeyError:
-            self['Trees_Saplings_DiameterClass_Sample']['SapEntryTeam'] = self['Trees_Saplings_DiameterClass_Sample'][
-                'FieldTeam']
+            self['Trees_Saplings_DiameterClass_Sample']['SapEntryTeam'] = ""
 
-        self['Trees_Seedlings_HeightClass_Sample']['SeedFieldTeam'] = self['Trees_Seedlings_HeightClass_Sample']['FieldTeam']
+        try:
+            self['Trees_Seedlings_HeightClass_Sample']['SeedFieldTeam'] = self['Trees_Seedlings_HeightClass_Sample']['FieldTeam']
+        except KeyError:
+            self['Trees_Seedlings_HeightClass_Sample']['SeedFieldTeam'] = ""
         try:
             self['Trees_Seedlings_HeightClass_Sample']['SeedEntryTeam'] = self['Trees_Seedlings_HeightClass_Sample']['EntryTeam']
         except KeyError:
-            self['Trees_Seedlings_HeightClass_Sample']['SeedEntryTeam'] = self['Trees_Seedlings_HeightClass_Sample'][
-                'FieldTeam']
+            self['Trees_Seedlings_HeightClass_Sample']['SeedEntryTeam'] = ""
 
         temp_events = self['SampleEvent'] \
             .merge(self['MacroPlot'], left_on='SampleEvent_Plot_GUID', right_on='MacroPlot_GUID', how='left') \
@@ -537,12 +643,15 @@ class FFIFile:
                                                             if row['MonitoringStatus_Base'] == 'Fire' else ''
                                                        ) +
                                                        (
+                                                           ''
+                                                           if 'MonitoringStatus_Suffix' not in temp_df.columns
+                                                           else
                                                            str(row['MonitoringStatus_Suffix']).strip(' ')
                                                            if (not pd.isna(row['MonitoringStatus_Suffix'])) and (row['MonitoringStatus_Suffix'] != 'Immediate')
                                                            else
-                                                               str(row['MonitoringStatus_Suffix'])[:3]
-                                                               if row['MonitoringStatus_Suffix'] == 'Immediate'
-                                                               else ''
+                                                           str(row['MonitoringStatus_Suffix'])[:3]
+                                                           if row['MonitoringStatus_Suffix'] == 'Immediate'
+                                                           else ''
                                                         ),
                                            axis=1)
 
@@ -556,6 +665,134 @@ class FFIFile:
         self._data_map['SampleEvent'] = event_df
         self._data_map['ProjectVisit'] = temp_df
 
+    # @staticmethod
+    def _rename_fields(self, table_name, df):
+        """
+        Renames fields in a table based on the mapping provided in FieldMap
+        """
+
+        # field_map = pd.read_csv("extra/FieldMap.csv")
+        if self.field_map.loc[self.field_map['TableName']==table_name].empty:
+            return df
+
+        # # Excel keeps generating long trails of ' ' at the end of strings. This fixes that
+        # field_map = field_map.applymap(lambda x: x.replace(' ', '')
+        #                     if type(x) == str
+        #                     else x)
+
+        temp_df = deepcopy(df)
+        temp_field_map = self.field_map.loc[self.field_map['TableName'] == table_name]
+
+        # Form the mappings as a dictionary
+        this_field_map = dict(zip(list(temp_field_map['OldColumn']), list(temp_field_map['ColumnName'])))
+        table_fields = [col for col in list(temp_field_map['OldColumn']) if col != 'nan']
+
+        # Only select fields in the table
+        select_fields = [field for field in table_fields if field in temp_df.columns]
+        almost_final_table = temp_df[select_fields].copy()
+        final_table = almost_final_table.rename(columns=this_field_map)
+
+        return final_table
+
+    def _rename_tables(self):
+        """
+        Files need to be renamed so the data_map keys align with the table names in the database
+        """
+        table_names = list(self.table_map['FFITable'])
+        new_map = {}
+
+        for old_table in table_names:
+
+            if old_table == 'TreeDamage':
+                pass
+
+            this_table_map = self.table_map.loc[self.table_map['FFITable'] == old_table]
+            table_df = self[old_table]
+            new_table = this_table_map['NewTable'].values[0]
+
+            new_df = self._rename_fields(new_table, table_df)
+            new_map[new_table] = new_df
+
+        self._data_map = new_map
+
+    def _create_table(self, table_name):
+        """
+        Custom logic for breaking out new tables.
+        """
+
+        possible_tables = ['Transect', 'TreeDamage', 'Personnel']
+        if self.many_tables:
+            if table_name in possible_tables:
+                if table_name == 'Transect':
+                    new_df = self['SurfaceFuels_Fine_Attribute']\
+                            .merge(self['SampleEvent'], on='EventID', how='left')
+                    # for transects at the Plot-level
+                    # .merge(self['MacroPlot'], left_on='SampleEvent_Plot_GUID', right_on='MacroPlot_GUID', how='left')
+                    temp_df = new_df[['EventID', 'Transect', 'Azimuth', 'Slope']].drop_duplicates()
+                    temp_df = temp_df.dropna(subset=['Azimuth'])
+                    temp_df['Length'] = 75
+                    self['Transect'] = temp_df
+
+                elif table_name == 'TreeDamage':
+                    damage_tables = []
+                    select_cols = ['EventID', 'TagNo', 'StemNum']
+                    val_cols = ['DamCd1', 'DamSev1', 'DamCd2', 'DamSev2', 'DamCd3', 'DamSev3', 'DamCd4', 'DamSev4',
+                                'DamCd5', 'DamSev5']
+                    new_df = self['Trees_Individuals_Attribute'] \
+                        .merge(self['SampleEvent'], on='EventID', how='left')
+
+                    if 'DamCd1' in new_df.columns:
+                        if 'DamSev1' in new_df.columns:
+                            d1 = new_df[select_cols + ['DamCd1', 'DamSev1']]
+                            d1.rename({'DamCd1': 'DamageCode', 'DamSev1': 'SeverityCode'}, axis=1, inplace=True)
+                            damage_tables.append(d1)
+
+                    if 'DamCd2' in new_df.columns:
+                        if 'DamSev2' in new_df.columns:
+                            d2 = new_df[select_cols + ['DamCd2', 'DamSev2']]
+                            d2.rename({'DamCd2': 'DamageCode', 'DamSev2': 'SeverityCode'}, axis=1, inplace=True)
+                            damage_tables.append(d2)
+
+                    if 'DamCd3' in new_df.columns:
+                        if 'DamSev3' in new_df.columns:
+                            d3 = new_df[select_cols + ['DamCd3', 'DamSev3']]
+                            d3.rename({'DamCd3': 'DamageCode', 'DamSev3': 'SeverityCode'}, axis=1, inplace=True)
+                            damage_tables.append(d3)
+
+                    if 'DamCd4' in new_df.columns:
+                        if 'DamSev4' in new_df.columns:
+                            d4 = new_df[select_cols + ['DamCd4', 'DamSev4']]
+                            d4.rename({'DamCd4': 'DamageCode', 'DamSev4': 'SeverityCode'}, axis=1, inplace=True)
+                            damage_tables.append(d4)
+
+                    if 'DamCd5' in new_df.columns:
+                        if 'DamSev5' in new_df.columns:
+                            d5 = new_df[select_cols + ['DamCd5', 'DamSev5']]
+                            d5.rename({'DamCd5': 'DamageCode', 'DamSev5': 'SeverityCode'}, axis=1, inplace=True)
+                            damage_tables.append(d5)
+
+                    code_df = pd.concat(damage_tables)
+                    final_df = code_df.dropna(subset=['DamageCode', 'SeverityCode'], how='all')
+                    final_df = final_df.dropna(subset=['DamageCode'], how='all')
+
+                    # dam_df = new_df.loc[:, new_df.columns.isin(select_cols)]
+                    # codes_df = dam_df.melt(id_vars=['EventID', 'TagNo', 'StemNum'],
+                    #                        value_vars=[c for c in dam_df.columns if c in dam_cols],
+                    #                        value_name='DamageCode')\
+                    #     .drop(columns=['variable'])\
+                    #     .sort_values(['EventID', 'TagNo', 'StemNum'])
+                    # sev_df = dam_df.melt(id_vars=['EventID', 'TagNo', 'StemNum'],
+                    #                        value_vars=[c for c in dam_df.columns if c in sev_cols],
+                    #                        value_name='DamageSev')\
+                    #     .drop(columns=['variable'])\
+                    #     .sort_values(['EventID', 'TagNo', 'StemNum'])
+                    # codes_df['DamageSev'] = sev_df['DamageSev']
+                    # final_df = codes_df.dropna(subset=['DamageCode', 'DamageSev'], how='all')
+                    self._data_map['TreeDamage'] = final_df
+                    self['Trees_Individuals_Attribute'].drop(columns=[col for col in val_cols
+                                                                      if col in self['Trees_Individuals_Attribute'].columns],
+                                                             inplace=True)
+
     def _insert_into_db(self, ffi_db, table):
         """
         Checks foreign key constraints and inserts any necessary tables first.
@@ -568,27 +805,28 @@ class FFIFile:
 
         # Next block pulls in the field and table mappings that were built for the old column and table names to align
         # with the new ones.
-        table_map = pd.read_csv("extra/TableMap.csv")
-        field_map = pd.read_csv("extra/FieldMap.csv")
-        field_map['TableName'] = field_map.apply(lambda r: r['TableName'].strip(), axis=1)
-        field_map['OldColumn'] = field_map.apply(lambda r: str(r['OldColumn']).strip(), axis=1)
-        field_map['ColumnName'] = field_map.apply(lambda r: r['ColumnName'].strip(), axis=1)
+        # table_map = pd.read_csv("extra/TableMap.csv")
+        # field_map = pd.read_csv("extra/FieldMap.csv")
+        # field_map['TableName'] = field_map.apply(lambda r: r['TableName'].strip(), axis=1)
+        # field_map['OldColumn'] = field_map.apply(lambda r: str(r['OldColumn']).strip(), axis=1)
+        # field_map['ColumnName'] = field_map.apply(lambda r: str(r['ColumnName']).strip(), axis=1)
 
-        this_table_map = table_map.loc[table_map['FFITable'] == table]
-        if not this_table_map.empty:
-            new_table_name = this_table_map['NewTable'].values[0]
-            table_name = new_table_name
-
-            temp_field_map = field_map.loc[field_map['TableName'] == table_name]
-            this_field_map = dict(zip(list(temp_field_map['OldColumn']), list(temp_field_map['ColumnName'])))
-            table_fields = [col for col in list(temp_field_map['OldColumn']) if col != 'nan']
+        # this_table_map = table_map.loc[table_map['FFITable'] == table]
+        # if not this_table_map.empty:
+            # new_table_name = this_table_map['NewTable'].values[0]
+            # table_name = new_table_name
+            #
+            # temp_field_map = field_map.loc[field_map['TableName'] == table_name]
+            # this_field_map = dict(zip(list(temp_field_map['OldColumn']), list(temp_field_map['ColumnName'])))
+            # table_fields = [col for col in list(temp_field_map['OldColumn']) if col != 'nan']
 
             # handle key constraints
+        if table in self.new_tables:
             pks = ffi_db.get_primary_keys()
             fks = ffi_db.get_foreign_keys()
 
-            table_fks = fks[table_name]
-            table_pks = pks[table_name]
+            table_fks = fks[table]
+            table_pks = pks[table]
             # multi_pk = len(table_pks) > 1
 
             # we need to ensure that the tables on which there are foreign key constraints are entered before we upload
@@ -604,11 +842,11 @@ class FFIFile:
                             self._insert_into_db(ffi_db, add_table)
 
             xml_table = self[table]
-            select_fields = [field for field in table_fields if field in xml_table.columns]
-            final_table = xml_table[select_fields].copy()
+            # select_fields = [field for field in table_fields if field in xml_table.columns]
+            # final_table = xml_table[select_fields].copy()
 
             if table == 'ProjectVisit':
-                final_table.drop_duplicates(inplace=True)
+                xml_table.drop_duplicates(inplace=True)
 
             # Construct the VALUES part of the statement
             val_list = []
@@ -616,95 +854,105 @@ class FFIFile:
             null_cols = []
 
             # enumerate rows and each value in each row
-            for _, row in final_table.iterrows():
-                row_vals = []
-                for idx, val in enumerate(row):
-                    col = final_table.columns[idx]
-                    col_type = final_table[col].dtype
-                    new_col = this_field_map[col]
-
-                    if new_col not in col_list:
-                        col_list.append(new_col)
-
-                    # make sure strings get tick marks and ' is converted to '' for the SQL
-                    if col_type in ['float64', 'int64', 'boolean']:
-                        row_vals.append(str(val))
-                    elif (val is None) or (str(val) == 'nan') or (new_col == 'Offset' and val in ['False', 'True']):
-                        row_vals.append('NULL')
-                    else:
-                        row_vals.append(f"""'{str(val).replace("'", "''")}'""")
-                val_list.append(f"({', '.join(row_vals)})")
-
-            values_part = ', '.join(val_list)
+            # for _, row in xml_table.iterrows():
+            #     row_vals = []
+            #     for idx, val in enumerate(row):
+            #         col = xml_table.columns[idx]
+            #         col_type = xml_table[col].dtype
+            #         # new_col = this_field_map[col]
+            #
+            #         if col not in col_list:
+            #             col_list.append(col)
+            #
+            #         # make sure strings get tick marks and ' is converted to '' for the SQL
+            #         if col_type in ['float64', 'int64', 'boolean']:
+            #             row_vals.append(str(val))
+            #         elif (val is None) or (str(val) == 'nan') or (col == 'Offset' and val in ['False', 'True']):
+            #             row_vals.append('NULL')
+            #         else:
+            #             row_vals.append(f"""'{str(val).replace("'", "''")}'""")
+            #     val_list.append(f"({', '.join(row_vals)})")
+            #
+            # values_part = ', '.join(val_list)
 
             # constructs comma-delimited lists of column names
-            cols_str = ', '.join(col_list)
+            cols = list(xml_table.columns)
+            cols_str = ', '.join(cols)
             source_cols = [f'source.{c}'
-                           for c in col_list]
+                           for c in cols]
             source_col_str = ', '.join(source_cols)
 
             # Constructs identity relations for primary keys
-            pk_strings = [f'target.{pk} = source.{pk}'
-                          for pk in table_pks]
+            if table == 'TreeDamage':
+                pk_strings = [f'target.{c} = source.{c}'
+                              for c in cols]
+            else:
+                pk_strings = [f'target.{pk} = source.{pk}'
+                              for pk in table_pks]
             pk_part = ' AND '.join(pk_strings)
 
             # Generate the full MERGE INTO statement
             merge_into_sql = f"""
-            MERGE INTO {table_name} AS target
-            USING (
-                VALUES
-                    {values_part}
-                )
-                AS source ({cols_str})
+            MERGE INTO dbo.{table} WITH (HOLDLOCK) AS target
+            USING staging.{table} AS source 
                 ON {pk_part}
-            WHEN NOT MATCHED THEN
+            WHEN NOT MATCHED BY target THEN
                 INSERT ({cols_str})
                 VALUES ({source_col_str});
             """
 
+            ffi_db.create_schema('staging')
+
             with ffi_db.start_session() as sesh:
+                xml_table.to_sql(table, sesh.bind, schema='staging', if_exists='replace', index=False)
                 try:
-                    count_sql = f"SELECT COUNT(*) AS Size FROM {table_name}"
+
+                    count_sql = f"SELECT COUNT(*) AS Size FROM {table}"
                     before_df = pd.read_sql(count_sql, sesh.bind)  # Compare before and after row count of tables
                     before_count = before_df['Size'].values[0]
 
-                    # Insert data
+                    # # Insert data
                     sesh.execute(merge_into_sql)
                     sesh.commit()
-
-                    # Get count after insert
+                    #
+                    # # Get count after insert
                     after_df = pd.read_sql(count_sql, sesh.bind)
                     after_count = after_df['Size'].values[0]
-
+                    #
                     count_diff = after_count - before_count
-
-                    # Then we insert into our logging table for who made changes to the database tables
-                    if count_diff != 0:
-                        change_type = "INSERT" if count_diff > 0 else "DELETE"
-
-                        # handle datetime
-                        dt = str(datetime.datetime.now())
-                        new_dt = re.findall(r'(.*)\.\d{4}', dt)[0]
-
-                        # construct log data and insert
-                        change_df = DataFrame({'User': [self._user],
-                                               'Time': [new_dt],
-                                               'Table': [table_name],
-                                               'ChangeType': [change_type],
-                                               'Changes': [abs(count_diff)]})
-                        change_df.to_sql('UpdateLog', sesh.bind, if_exists='append', index=False)
-                    print(f"Inserted {count_diff} rows into {table_name}.")
-                    logging.info(f"Inserted {count_diff} rows into {table_name}.")
+                    #
+                    # # Then we insert into our logging table for who made changes to the database tables
+                    # if count_diff != 0:
+                    #     change_type = "INSERT" if count_diff > 0 else "DELETE"
+                    #
+                    #     # handle datetime
+                    #     dt = str(datetime.datetime.now())
+                    #     new_dt = re.findall(r'(.*)\.\d{4}', dt)[0]
+                    #
+                    #     # construct log data and insert
+                    #     change_df = DataFrame({'User': [self._user],
+                    #                            'Time': [new_dt],
+                    #                            'Table': [table],
+                    #                            'ChangeType': [change_type],
+                    #                            'Changes': [abs(count_diff)]})
+                    #     change_df.to_sql('UpdateLog', sesh.bind, if_exists='append', index=False)
+                    print(f"Inserted {count_diff} rows into {table}.")
+                    logging.info(f"Inserted {count_diff} rows into {table}.")
 
                 except Exception as e:
                     # If there's any issues merging the data, throw an error and rollback the MERGE
-                    print(f"Failed to insert data into {table_name}.")
+                    print(f"Failed to insert data into {table}.")
                     self.insert_failed.append(table)
                     sesh.rollback()
                     error = str(e)
                     if len(error) > 0:
-                        print(error)
-                        logging.exception(f"Failed to insert data for {table_name}.")
+                        error_text = re.findall(r'\[SQL Server\](.*)\(\d+\)', error)
+                        if len(error_text) > 0:
+                            error = error_text[0]
+                        logging.warning(f"Failed to insert data for {table}.")
+                        logging.error(error, exc_info=False)
+
+            self._processed.append(table)
 
     def extract(self):
 
@@ -719,6 +967,7 @@ class FFIFile:
 
         self._attr_to_many()
         self._sample_to_many()
+        self.many_tables = True
 
         # need to normalize project names for ProjectID
         self['ProjectUnit']['ProjectID'] = self['ProjectUnit'].apply(
@@ -731,9 +980,16 @@ class FFIFile:
         self['MacroPlot']['AdminUnit'] = self.admin_unit
 
         # Create transects from SurfaceFuels_Fine_Attribute
-        temp_df = self['SurfaceFuels_Fine_Attribute'][['EventID', 'Transect', 'Azimuth', 'Slope']].drop_duplicates()
-        temp_df['Length'] = 75
-        self['Transect'] = temp_df
+        # new_df = self['SurfaceFuels_Fine_Attribute']\
+        #     .merge(self['SampleEvent'], on='EventID', how='left')
+        # # for transects at the Plot-level
+        # # .merge(self['MacroPlot'], left_on='SampleEvent_Plot_GUID', right_on='MacroPlot_GUID', how='left')
+        # temp_df = new_df[['EventID', 'Transect', 'Azimuth', 'Slope']].drop_duplicates()
+        # temp_df = temp_df.dropna(subset=['Azimuth'])
+        # temp_df['Length'] = 75
+        # self['Transect'] = temp_df
+        self._create_table('Transect')
+        self._create_table('TreeDamage')
 
         self._process_events()
         self._process_projects()
@@ -744,6 +1000,7 @@ class FFIFile:
         del self._data_map['AttributeData']
 
         self.many_tables = True
+        self._rename_tables()
 
     def load(self, ffi_db):
         """
@@ -751,9 +1008,19 @@ class FFIFile:
         """
         print(f'Inserting data for {self.file}')
         logging.info(f"Inserting data for {self.file}")
+
+        # need to insert these tables first
+        # self._insert_into_db(ffi_db, 'AdminUnit')
+        # self._insert_into_db(ffi_db, 'Project')
+        # self._insert_into_db(ffi_db, 'Plot')
+        # self._insert_into_db(ffi_db, 'Event')
+        # self._processed = self._processed + ['AdminUnit', 'Project', 'Plot', 'Event']
+        #
+        # self._data_map = [temp for temp in self._data_map if temp not in first_tables]
         for table in self._data_map:
-            if table not in self._excluded:
-                self._insert_into_db(ffi_db, table)
+            if table in self.new_tables:
+                if table not in self._processed:
+                    self._insert_into_db(ffi_db, table)
 
     def tables_to_csv(self):
 
@@ -763,6 +1030,3 @@ class FFIFile:
         for table in self._data_map:
             df = self._data_map[table]
             df.to_csv(f'csv/{table}.csv')
-
-
-
